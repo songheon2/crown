@@ -740,4 +740,4 @@ def _self_test_relaxations() -> None:
 
 if __name__ == "__main__":
     _self_test_relaxations()
-    run_xor_demo(eps=0.02)
+    run_xor_demo(eps=0.22)
