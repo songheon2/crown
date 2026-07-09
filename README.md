@@ -54,6 +54,46 @@ lirpa_forward_backward_fc_matlab
 
 MATLAB 코드 내부의 `run_xor_demo(...)` 인자를 바꿔 epsilon 실험을 반복하면 동일한 경향을 확인할 수 있습니다.
 
+## C++ 실행 가이드
+
+C++ 버전은 아래 파일에 있습니다.
+
+- `lirpa_forward_backward_fc.cpp` (`std::vector` 기반 구현)
+- `lirpa_forward_backward_fc_array.cpp` (배열 기반 구현)
+
+### 1) 빌드
+
+Windows PowerShell + g++(MinGW 등) 기준:
+
+```powershell
+g++ -std=c++17 -O2 lirpa_forward_backward_fc.cpp -o lirpa_forward_backward_fc.exe
+g++ -std=c++17 -O2 lirpa_forward_backward_fc_array.cpp -o lirpa_forward_backward_fc_array.exe
+```
+
+### 2) 기본 실행 (eps=0.02)
+
+```powershell
+./lirpa_forward_backward_fc.exe
+./lirpa_forward_backward_fc_array.exe
+```
+
+### 3) epsilon을 바꿔 실행하기
+
+실행 인자로 epsilon 값을 넣으면 됩니다.
+
+```powershell
+./lirpa_forward_backward_fc.exe 0.22
+./lirpa_forward_backward_fc.exe 0.23
+./lirpa_forward_backward_fc_array.exe 0.22
+./lirpa_forward_backward_fc_array.exe 0.23
+```
+
+권장 실험:
+
+- `0.00`, `0.10`, `0.22`, `0.23` 순서로 실행
+- 각 입력점별 `certified=True/False`를 비교
+- forward/backward 결과가 어떻게 달라지는지 함께 확인
+
 ## 출력 해석 팁
 
 각 입력점마다 다음 정보가 출력됩니다.
