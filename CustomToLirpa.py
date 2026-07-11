@@ -1,14 +1,14 @@
 """
-Custom 텍스트 형식 → LiRPA FullyConnectedNetwork 변환기
+Custom 바이너리 형식 → LiRPA FullyConnectedNetwork 변환기
 
-Custom 형식 (OnnxToCustom.py / GenericNNEncoding.py와 동일):
-    Line 1        : m  (가중치 레이어 수)
-    Lines 2..m+2  : 각 레이어의 노드 수 n_0, n_1, ..., n_m  (한 줄에 하나)
-    이후 m개 블록 :
-        n_{i+1} 행 x n_i 열의 가중치 행렬  (행 단위로 공백 구분)
-        n_{i+1} 개의 바이어스 값  (한 줄에 공백 구분)
-
-토큰 단위로 파싱하므로 줄바꿈 위치는 유연하게 허용된다.
+Custom 바이너리 형식 (OnnxToCustom.py / CustomBinary.py와 동일, 리틀엔디안 고정):
+    magic   : 4 bytes   b'NNCB'
+    version : int32      (=1)
+    m       : int32      (가중치 레이어 수)
+    sizes   : int32[m+1] (레이어별 노드 수 n_0..n_m)
+    이후 m개 블록:
+        W_i : float64[n_out, n_in]  (row-major)
+        b_i : float64[n_out]
 
 활성화 함수는 파일에 저장되어 있지 않으므로, 기존 관례(GenericNNEncoding.py,
 OnnxToCustom.py)를 따라 은닉층은 ReLU, 출력층은 항등(linear, logit 그대로)으로
@@ -17,41 +17,38 @@ OnnxToCustom.py)를 따라 은닉층은 ReLU, 출력층은 항등(linear, logit 
 
 from __future__ import annotations
 
+import struct
+
 import numpy as np
 
 from lirpa_forward_backward_fc import FullyConnectedNetwork, LiRPAForward, LiRPABackward
 
+_MAGIC = b"NNCB"
+_VERSION = 1
+
 
 def load_custom_network(filepath: str) -> FullyConnectedNetwork:
-    """Custom 텍스트 형식 파일을 읽어 FullyConnectedNetwork로 반환한다."""
-    with open(filepath, "r") as f:
-        tokens = f.read().split()
+    """Custom 바이너리 형식(.bin) 파일을 읽어 FullyConnectedNetwork로 반환한다."""
+    with open(filepath, "rb") as f:
+        magic = f.read(4)
+        if magic != _MAGIC:
+            raise ValueError(f"'{filepath}'는 유효한 커스텀 바이너리 파일이 아닙니다 (magic 불일치)")
 
-    pos = 0
+        version, = struct.unpack("<i", f.read(4))
+        if version != _VERSION:
+            raise ValueError(f"지원하지 않는 커스텀 바이너리 버전입니다: {version}")
 
-    def read_int() -> int:
-        nonlocal pos
-        v = int(tokens[pos])
-        pos += 1
-        return v
+        m, = struct.unpack("<i", f.read(4))
+        sizes = list(struct.unpack(f"<{m + 1}i", f.read(4 * (m + 1))))
 
-    def read_float() -> float:
-        nonlocal pos
-        v = float(tokens[pos])
-        pos += 1
-        return v
-
-    m = read_int()
-    sizes = [read_int() for _ in range(m + 1)]
-
-    weights = []
-    biases = []
-    for i in range(m):
-        n_in, n_out = sizes[i], sizes[i + 1]
-        W = np.array([[read_float() for _ in range(n_in)] for _ in range(n_out)], dtype=float)
-        b = np.array([read_float() for _ in range(n_out)], dtype=float)
-        weights.append(W)
-        biases.append(b)
+        weights = []
+        biases = []
+        for i in range(m):
+            n_in, n_out = sizes[i], sizes[i + 1]
+            W = np.fromfile(f, dtype="<f8", count=n_out * n_in).reshape(n_out, n_in)
+            b = np.fromfile(f, dtype="<f8", count=n_out)
+            weights.append(W)
+            biases.append(b)
 
     activations = ["relu"] * (m - 1) + ["linear"]
 
@@ -102,6 +99,6 @@ def run_xor_demo(filepath: str, eps: float = 0.02) -> None:
 if __name__ == "__main__":
     import sys
 
-    filepath = sys.argv[1] if len(sys.argv) > 1 else "Custom/xor_network.txt"
+    filepath = sys.argv[1] if len(sys.argv) > 1 else "Custom/xor_network.bin"
     eps = float(sys.argv[2]) if len(sys.argv) > 2 else 0.22
     run_xor_demo(filepath, eps)

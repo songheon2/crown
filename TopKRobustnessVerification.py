@@ -118,6 +118,8 @@ def sweep(
                 t_count += 1
             else:
                 f_count += 1
+            if (i + 1) % 1000 == 0:
+                print(f"  eps={eps:>10}: {i + 1}/{X.shape[0]} points done (T={t_count} F={f_count})")
         total = t_count + f_count
         results[eps] = {
             "T": t_count,
@@ -130,27 +132,36 @@ def sweep(
 
 if __name__ == "__main__":
     import sys
+    import time
 
-    from LargePickleLoader import load_rows
+    from data_split import load_test_rows
 
     network_path = (
         sys.argv[1]
         if len(sys.argv) > 1
-        else "Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.txt"
+        else "Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin"
     )
     data_path = (
         sys.argv[2]
         if len(sys.argv) > 2
-        else "mMIMO_AS_training_data_20000_80_H_HTH_ORG_1D-003.pickle"
+        else "C:\AI_Verification\wireless\Pickle/mMIMO_AS_training_data_20000_80_H_HTH_ORG_1D-003.pickle"
     )
-    n_points = int(sys.argv[3]) if len(sys.argv) > 3 else 10000
+    no_test_files = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+    n_points = int(sys.argv[4]) if len(sys.argv) > 4 else None
 
     network = load_custom_network(network_path)
-    X = load_rows(data_path, n_points)
-    print(f"loaded {X.shape[0]} points (dim={X.shape[1]}) from {data_path}")
+    X = load_test_rows(data_path, no_dataInFile=20000, no_test_files=no_test_files)
+    if n_points is not None:
+        X = X[:n_points]
+    print(f"loaded {X.shape[0]} points (dim={X.shape[1]}) from {data_path} (test files={no_test_files})")
 
-    eps_list = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
+    # eps_list = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
+    eps_list = [4e-3, 6e-3, 8e-3]
+    start_time = time.perf_counter()
     results = sweep(network, X, eps_list, k=8, max_diff=0)
+    elapsed = time.perf_counter() - start_time
 
     for eps, r in results.items():
         print(f"eps={eps:>10}: T={r['T']:>4} F={r['F']:>4} ratio={r['ratio']:.3f}")
+
+    print(f"total elapsed: {elapsed:.2f}s")
