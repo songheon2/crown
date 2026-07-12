@@ -619,6 +619,385 @@ class LiRPABackward:
         final_upper = affine_max(final.upper_A, final.upper_c, x0, eps)
         return final, final_lower, final_upper, layer_bounds
 
+class LiRPABackwardOnly:
+    """
+    Backward-only CROWN/LiRPA for a FullyConnectedNetwork.
+
+    Unlike :class:`LiRPABackward`, this class never invokes forward LiRPA to
+    obtain activation intervals.  To construct the relaxation of layer k, it
+    bounds the pre-activation
+
+        s^(k) = W^(k) f^(k-1) + b^(k)
+
+    by back-substituting through the already constructed relaxations of layers
+    1, ..., k-1 all the way to the original input.  The resulting affine lower
+    and upper bounds are concretized over [x0-eps, x0+eps], and only then is the
+    relaxation for activation k constructed.
+
+    Consequently, relaxation construction proceeds from the first layer to the
+    last, but every intermediate pre-activation bound is itself obtained by a
+    backward pass to the input.  After all relaxations have been constructed, a
+    final backward pass evaluates the requested output specification.
+    """
+
+    def __init__(
+        self,
+        activation_relaxations: Dict[str, ActivationRelaxation] | None = None,
+    ):
+        self.activation_relaxations: Dict[str, ActivationRelaxation] = {
+            "relu": ReLURelaxation(),
+            "sigmoid": SigmoidRelaxation(),
+        }
+        if activation_relaxations:
+            self.activation_relaxations.update(
+                {name.lower(): relaxation for name, relaxation in activation_relaxations.items()}
+            )
+
+    @staticmethod
+    def _linear_relaxation(
+        lower: Array,
+        upper: Array,
+    ) -> Tuple[Array, Array, Array, Array]:
+        """Return the exact relaxation for the identity activation."""
+        del upper  # Kept in the interface for consistency with nonlinear relaxations.
+        alpha = np.ones_like(lower)
+        beta = np.zeros_like(lower)
+        return alpha, beta, alpha.copy(), beta.copy()
+
+    @staticmethod
+    def _backward_one_layer(
+        lower_M: Array,
+        lower_p: Array,
+        upper_M: Array,
+        upper_p: Array,
+        W: Array,
+        b: Array,
+        alpha_l: Array,
+        beta_l: Array,
+        alpha_u: Array,
+        beta_u: Array,
+    ) -> Tuple[Array, Array, Array, Array]:
+        """Back-substitute affine bounds through one activation and linear layer."""
+        lower_M_pos = positive_part(lower_M)
+        lower_M_neg = negative_part(lower_M)
+        upper_M_pos = positive_part(upper_M)
+        upper_M_neg = negative_part(upper_M)
+
+        # Lower expression: positive coefficients select the activation lower
+        # relaxation, while negative coefficients select the upper relaxation.
+        lower_s_coeff = (
+            lower_M_pos * alpha_l[None, :]
+            + lower_M_neg * alpha_u[None, :]
+        )
+        new_lower_M = lower_s_coeff @ W
+        new_lower_p = (
+            lower_M_pos @ (alpha_l * b + beta_l)
+            + lower_M_neg @ (alpha_u * b + beta_u)
+            + lower_p
+        )
+
+        # Upper expression: positive coefficients select the activation upper
+        # relaxation, while negative coefficients select the lower relaxation.
+        upper_s_coeff = (
+            upper_M_pos * alpha_u[None, :]
+            + upper_M_neg * alpha_l[None, :]
+        )
+        new_upper_M = upper_s_coeff @ W
+        new_upper_p = (
+            upper_M_pos @ (alpha_u * b + beta_u)
+            + upper_M_neg @ (alpha_l * b + beta_l)
+            + upper_p
+        )
+
+        return new_lower_M, new_lower_p, new_upper_M, new_upper_p
+
+    @staticmethod
+    def _compose_post_activation_bound(
+        pre: AffineBound,
+        alpha_l: Array,
+        beta_l: Array,
+        alpha_u: Array,
+        beta_u: Array,
+    ) -> AffineBound:
+        """
+        Construct diagnostic affine bounds for f^(k) from bounds for s^(k).
+
+        These post-activation bounds are returned through LayerBound for API
+        compatibility and inspection.  They are not used to construct later
+        relaxations; later pre-activation bounds are always obtained by fresh
+        backward substitution.
+        """
+        alpha_l_pos = positive_part(alpha_l)
+        alpha_l_neg = negative_part(alpha_l)
+        alpha_u_pos = positive_part(alpha_u)
+        alpha_u_neg = negative_part(alpha_u)
+
+        return AffineBound(
+            lower_A=(
+                alpha_l_pos[:, None] * pre.lower_A
+                + alpha_l_neg[:, None] * pre.upper_A
+            ),
+            lower_c=(
+                alpha_l_pos * pre.lower_c
+                + alpha_l_neg * pre.upper_c
+                + beta_l
+            ),
+            upper_A=(
+                alpha_u_pos[:, None] * pre.upper_A
+                + alpha_u_neg[:, None] * pre.lower_A
+            ),
+            upper_c=(
+                alpha_u_pos * pre.upper_c
+                + alpha_u_neg * pre.lower_c
+                + beta_u
+            ),
+        )
+
+    def _relax_activation(
+        self,
+        activation_name: str,
+        pre_lower: Array,
+        pre_upper: Array,
+    ) -> Tuple[Array, Array, Array, Array]:
+        if activation_name == "linear":
+            return self._linear_relaxation(pre_lower, pre_upper)
+
+        relaxation = self.activation_relaxations.get(activation_name)
+        if relaxation is None:
+            raise ValueError(
+                f"No relaxation registered for activation: {activation_name}"
+            )
+        return relaxation.relax(pre_lower, pre_upper)
+
+    def _build_one_layer_relaxation(
+        self,
+        network: FullyConnectedNetwork,
+        layer_index: int,
+        x0: Array,
+        eps: float | Array,
+        previous_layer_bounds: List[LayerBound],
+    ) -> LayerBound:
+        """
+        Build the pre-activation bound and relaxation for one layer.
+
+        ``layer_index`` is zero-based, so it represents mathematical layer
+        k = layer_index + 1.  The method assumes relaxations for every earlier
+        layer have already been constructed.
+        """
+        if len(previous_layer_bounds) != layer_index:
+            raise ValueError(
+                "Relaxations must be constructed consecutively from the first layer."
+            )
+
+        # Start from the exact target pre-activation
+        #     s^(k) = W^(k) f^(k-1) + b^(k).
+        lower_M = network.weights[layer_index].copy()
+        upper_M = network.weights[layer_index].copy()
+        lower_p = network.biases[layer_index].copy()
+        upper_p = network.biases[layer_index].copy()
+
+        # Back-substitute through layers k-1, ..., 1 using only relaxations
+        # that were themselves constructed by backward-only analysis.
+        for previous_index in range(layer_index - 1, -1, -1):
+            previous = previous_layer_bounds[previous_index]
+            lower_M, lower_p, upper_M, upper_p = self._backward_one_layer(
+                lower_M=lower_M,
+                lower_p=lower_p,
+                upper_M=upper_M,
+                upper_p=upper_p,
+                W=network.weights[previous_index],
+                b=network.biases[previous_index],
+                alpha_l=previous.alpha_lower,
+                beta_l=previous.beta_lower,
+                alpha_u=previous.alpha_upper,
+                beta_u=previous.beta_upper,
+            )
+
+        pre = AffineBound(
+            lower_A=lower_M,
+            lower_c=lower_p,
+            upper_A=upper_M,
+            upper_c=upper_p,
+        )
+        pre_lower = affine_min(pre.lower_A, pre.lower_c, x0, eps)
+        pre_upper = affine_max(pre.upper_A, pre.upper_c, x0, eps)
+
+        alpha_l, beta_l, alpha_u, beta_u = self._relax_activation(
+            network.activations[layer_index],
+            pre_lower,
+            pre_upper,
+        )
+
+        post = self._compose_post_activation_bound(
+            pre=pre,
+            alpha_l=alpha_l,
+            beta_l=beta_l,
+            alpha_u=alpha_u,
+            beta_u=beta_u,
+        )
+        post_lower = affine_min(post.lower_A, post.lower_c, x0, eps)
+        post_upper = affine_max(post.upper_A, post.upper_c, x0, eps)
+
+        return LayerBound(
+            pre_affine=pre,
+            pre_lower=pre_lower,
+            pre_upper=pre_upper,
+            alpha_lower=alpha_l,
+            beta_lower=beta_l,
+            alpha_upper=alpha_u,
+            beta_upper=beta_u,
+            post_affine=post,
+            post_lower=post_lower,
+            post_upper=post_upper,
+        )
+
+    @staticmethod
+    def _validate_input(
+        network: FullyConnectedNetwork,
+        x0: Array,
+        eps: float | Array,
+    ) -> Tuple[Array, Array]:
+        x0_array = np.asarray(x0, dtype=float)
+        if x0_array.ndim != 1:
+            raise ValueError("x0 must be a vector.")
+        if x0_array.shape[0] != network.input_dim:
+            raise ValueError(
+                f"x0 dimension {x0_array.shape[0]} does not match "
+                f"network input dimension {network.input_dim}."
+            )
+
+        eps_array = np.asarray(eps, dtype=float)
+        try:
+            eps_broadcast = np.broadcast_to(eps_array, x0_array.shape)
+        except ValueError as exc:
+            raise ValueError("eps must be scalar or broadcastable to x0.") from exc
+        if np.any(eps_broadcast < 0.0):
+            raise ValueError("eps must be nonnegative.")
+
+        return x0_array, eps_array
+
+    @staticmethod
+    def _initialize_output_specification(
+        output_dim: int,
+        output_lower_M: Array | None,
+        output_lower_p: Array | None,
+        output_upper_M: Array | None,
+        output_upper_p: Array | None,
+    ) -> Tuple[Array, Array, Array, Array]:
+        lower_M = (
+            np.eye(output_dim)
+            if output_lower_M is None
+            else np.asarray(output_lower_M, dtype=float)
+        )
+        upper_M = (
+            np.eye(output_dim)
+            if output_upper_M is None
+            else np.asarray(output_upper_M, dtype=float)
+        )
+
+        if lower_M.ndim != 2 or upper_M.ndim != 2:
+            raise ValueError("Output specification matrices must be two-dimensional.")
+        if lower_M.shape[1] != output_dim or upper_M.shape[1] != output_dim:
+            raise ValueError(
+                "Output specification matrices must have one column per network output."
+            )
+        if lower_M.shape[0] != upper_M.shape[0]:
+            raise ValueError(
+                "Lower and upper output specifications must have the same number of rows."
+            )
+
+        spec_dim = lower_M.shape[0]
+        lower_p = (
+            np.zeros(spec_dim)
+            if output_lower_p is None
+            else np.asarray(output_lower_p, dtype=float)
+        )
+        upper_p = (
+            np.zeros(spec_dim)
+            if output_upper_p is None
+            else np.asarray(output_upper_p, dtype=float)
+        )
+
+        if lower_p.ndim != 1 or upper_p.ndim != 1:
+            raise ValueError("Output specification offsets must be vectors.")
+        if lower_p.shape[0] != spec_dim or upper_p.shape[0] != spec_dim:
+            raise ValueError("Output specification vectors must match their matrices.")
+
+        return lower_M, lower_p, upper_M, upper_p
+
+    def bound(
+        self,
+        network: FullyConnectedNetwork,
+        x0: Array,
+        eps: float | Array,
+        output_lower_M: Array | None = None,
+        output_lower_p: Array | None = None,
+        output_upper_M: Array | None = None,
+        output_upper_p: Array | None = None,
+    ) -> Tuple[AffineBound, Array, Array, List[LayerBound]]:
+        """
+        Compute backward-only CROWN bounds over [x0-eps, x0+eps].
+
+        The return value matches LiRPAForward.bound and LiRPABackward.bound:
+
+            final_affine_bound, numerical_lower, numerical_upper,
+            per_layer_bounds
+
+        By default the identity output specification bounds f^(L) itself.
+        Custom lower/upper output specifications are supported in the same form
+        as LiRPABackward.bound.
+        """
+        x0_array, eps_array = self._validate_input(network, x0, eps)
+
+        # Recursive Algorithm 3 can be evaluated iteratively because layer k
+        # depends only on relaxations 1, ..., k-1.  No forward LiRPA pass occurs.
+        layer_bounds: List[LayerBound] = []
+        for layer_index in range(len(network.weights)):
+            layer_bound = self._build_one_layer_relaxation(
+                network=network,
+                layer_index=layer_index,
+                x0=x0_array,
+                eps=eps_array,
+                previous_layer_bounds=layer_bounds,
+            )
+            layer_bounds.append(layer_bound)
+
+        output_dim = network.weights[-1].shape[0]
+        lower_M, lower_p, upper_M, upper_p = self._initialize_output_specification(
+            output_dim=output_dim,
+            output_lower_M=output_lower_M,
+            output_lower_p=output_lower_p,
+            output_upper_M=output_upper_M,
+            output_upper_p=output_upper_p,
+        )
+
+        # With all activation relaxations available, perform the final backward
+        # pass for the requested output specification.
+        for layer_index in range(len(network.weights) - 1, -1, -1):
+            layer_bound = layer_bounds[layer_index]
+            lower_M, lower_p, upper_M, upper_p = self._backward_one_layer(
+                lower_M=lower_M,
+                lower_p=lower_p,
+                upper_M=upper_M,
+                upper_p=upper_p,
+                W=network.weights[layer_index],
+                b=network.biases[layer_index],
+                alpha_l=layer_bound.alpha_lower,
+                beta_l=layer_bound.beta_lower,
+                alpha_u=layer_bound.alpha_upper,
+                beta_u=layer_bound.beta_upper,
+            )
+
+        final = AffineBound(
+            lower_A=lower_M,
+            lower_c=lower_p,
+            upper_A=upper_M,
+            upper_c=upper_p,
+        )
+        final_lower = affine_min(final.lower_A, final.lower_c, x0_array, eps_array)
+        final_upper = affine_max(final.upper_A, final.upper_c, x0_array, eps_array)
+        return final, final_lower, final_upper, layer_bounds
+
 def make_xor_network_from_note() -> FullyConnectedNetwork:
     """
     XOR network from the uploaded note.
@@ -652,8 +1031,10 @@ def xor_expected_label(x: Array) -> int:
 
 def run_xor_demo(eps: float = 0.02) -> None:
     network = make_xor_network_from_note()
+
     forward_verifier = LiRPAForward()
-    backward_verifier = LiRPABackward(forward_verifier)
+    forward_backward_verifier = LiRPABackward(forward_verifier)
+    backward_only_verifier = LiRPABackwardOnly()
 
     points = [
         np.array([0.0, 0.0]),
@@ -667,48 +1048,77 @@ def run_xor_demo(eps: float = 0.02) -> None:
     print()
 
     all_certified_forward = True
-    all_certified_backward = True
+    all_certified_forward_backward = True
+    all_certified_backward_only = True
+
     for x0 in points:
         y = network.forward(x0)
-        _, fwd_lb, fwd_ub, _ = forward_verifier.bound(network, x0, eps)
-        _, bwd_lb, bwd_ub, _ = backward_verifier.bound(network, x0, eps)
+
+        _, fwd_lb, fwd_ub, _ = forward_verifier.bound(
+            network, x0, eps
+        )
+        _, fb_lb, fb_ub, _ = forward_backward_verifier.bound(
+            network, x0, eps
+        )
+        _, bo_lb, bo_ub, _ = backward_only_verifier.bound(
+            network, x0, eps
+        )
+
         expected = xor_expected_label(x0)
 
         if expected == 1:
             fwd_certified = bool(fwd_lb[0] > 0.5)
-            bwd_certified = bool(bwd_lb[0] > 0.5)
+            fb_certified = bool(fb_lb[0] > 0.5)
+            bo_certified = bool(bo_lb[0] > 0.5)
             condition = "lower bound > 0.5"
         else:
             fwd_certified = bool(fwd_ub[0] < 0.5)
-            bwd_certified = bool(bwd_ub[0] < 0.5)
+            fb_certified = bool(fb_ub[0] < 0.5)
+            bo_certified = bool(bo_ub[0] < 0.5)
             condition = "upper bound < 0.5"
 
-        all_certified_forward = all_certified_forward and fwd_certified
-        all_certified_backward = all_certified_backward and bwd_certified
+        all_certified_forward &= fwd_certified
+        all_certified_forward_backward &= fb_certified
+        all_certified_backward_only &= bo_certified
 
         print(
             f"x0={x0.tolist()}, expected={expected}, "
             f"network_output={y[0]:.6f}"
         )
         print(
-            f"  forward  bound=[{fwd_lb[0]:.6f}, {fwd_ub[0]:.6f}], "
+            f"  forward          "
+            f"bound=[{fwd_lb[0]:.6f}, {fwd_ub[0]:.6f}], "
             f"certified={fwd_certified} ({condition})"
         )
         print(
-            f"  backward bound=[{bwd_lb[0]:.6f}, {bwd_ub[0]:.6f}], "
-            f"certified={bwd_certified} ({condition})"
+            f"  forward+backward "
+            f"bound=[{fb_lb[0]:.6f}, {fb_ub[0]:.6f}], "
+            f"certified={fb_certified} ({condition})"
         )
+        print(
+            f"  backward-only    "
+            f"bound=[{bo_lb[0]:.6f}, {bo_ub[0]:.6f}], "
+            f"certified={bo_certified} ({condition})"
+        )
+        print()
 
-    print()
-    if all_certified_forward:
-        print("Forward mode certifies all four XOR corner classifications for this epsilon.")
-    else:
-        print("Forward mode does not certify at least one XOR corner classification for this epsilon.")
+    mode_results = [
+        ("Forward mode", all_certified_forward),
+        ("Forward+backward mode", all_certified_forward_backward),
+        ("Backward-only mode", all_certified_backward_only),
+    ]
 
-    if all_certified_backward:
-        print("Backward mode certifies all four XOR corner classifications for this epsilon.")
-    else:
-        print("Backward mode does not certify at least one XOR corner classification for this epsilon.")
+    for mode_name, all_certified in mode_results:
+        if all_certified:
+            print(
+                f"{mode_name} certifies all four XOR corner "
+                f"classifications for this epsilon."
+            )
+        else:
+            print(
+                f"{mode_name} does not certify at least one XOR corner "
+                f"classification for this epsilon."
+            )
 
 
 def _self_test_relaxations() -> None:
