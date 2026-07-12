@@ -32,13 +32,39 @@ from typing import Dict, List
 import numpy as np
 
 from CustomToLirpa import load_custom_network
-from lirpa_forward_backward_fc import Array, FullyConnectedNetwork, LiRPABackward, LiRPAForward
+from lirpa_forward_backward_fc import (
+    Array,
+    FullyConnectedNetwork,
+    LiRPABackward,
+    LiRPABackwardOnly,
+    LiRPAForward,
+)
+
+# bound 계산 방식 선택자. "backward"(기본값)는 forward+backward(표준 CROWN),
+# "backward_only"는 중간 bound도 backward substitution만으로 구하는 방식,
+# "forward"는 순수 forward mode다.
+_METHOD_VERIFIER_FACTORIES = {
+    "forward": lambda: LiRPAForward(),
+    "backward": lambda: LiRPABackward(LiRPAForward()),
+    "backward_only": lambda: LiRPABackwardOnly(),
+}
 
 
-def crown_bounds(network: FullyConnectedNetwork, x0: Array, eps: float) -> tuple[Array, Array]:
-    """backward LiRPA(CROWN)로 모든 출력의 (lower, upper) bound를 구한다."""
-    backward_verifier = LiRPABackward(LiRPAForward())
-    _, lb, ub, _ = backward_verifier.bound(network, x0, eps)
+def crown_bounds(
+    network: FullyConnectedNetwork,
+    x0: Array,
+    eps: float,
+    method: str = "backward",
+) -> tuple[Array, Array]:
+    """LiRPA/CROWN bound 계산 방식(method)에 따라 모든 출력의 (lower, upper) bound를 구한다."""
+    factory = _METHOD_VERIFIER_FACTORIES.get(method)
+    if factory is None:
+        raise ValueError(
+            f"지원하지 않는 bound 계산 방식입니다: {method!r} "
+            f"({', '.join(_METHOD_VERIFIER_FACTORIES)} 중 하나여야 합니다)"
+        )
+    verifier = factory()
+    _, lb, ub, _ = verifier.bound(network, x0, eps)
     return lb, ub
 
 
@@ -87,11 +113,12 @@ def verify_point(
     eps: float,
     k: int = 8,
     max_diff: int = 0,
+    method: str = "backward",
 ) -> Dict:
     """단일 입력점 x0에 대해 top-k 선택의 로컬 강건성을 검증한다."""
     x0 = np.asarray(x0, dtype=float)
     y0 = network.forward(x0)
-    lb, ub = crown_bounds(network, x0, eps)
+    lb, ub = crown_bounds(network, x0, eps, method=method)
     return certify_topk_selection(y0, lb, ub, k=k, max_diff=max_diff)
 
 
@@ -101,6 +128,7 @@ def sweep(
     eps_list: List[float],
     k: int = 8,
     max_diff: int = 0,
+    method: str = "backward",
 ) -> Dict[float, Dict]:
     """
     여러 입력점(X: (N, input_dim))과 여러 eps 값에 대해 top-k 선택 강건성 검증을
@@ -113,7 +141,7 @@ def sweep(
         t_count = 0
         f_count = 0
         for i in range(X.shape[0]):
-            result = verify_point(network, X[i], eps, k=k, max_diff=max_diff)
+            result = verify_point(network, X[i], eps, k=k, max_diff=max_diff, method=method)
             if result["certified"]:
                 t_count += 1
             else:
@@ -148,17 +176,28 @@ if __name__ == "__main__":
     )
     no_test_files = int(sys.argv[3]) if len(sys.argv) > 3 else 2
     n_points = int(sys.argv[4]) if len(sys.argv) > 4 else None
+    method = sys.argv[5] if len(sys.argv) > 5 else "backward"
+
+    if method not in _METHOD_VERIFIER_FACTORIES:
+        raise ValueError(
+            f"지원하지 않는 bound 계산 방식입니다: {method!r} "
+            f"({', '.join(_METHOD_VERIFIER_FACTORIES)} 중 하나여야 합니다)"
+        )
 
     network = load_custom_network(network_path)
     X = load_test_rows(data_path, no_dataInFile=20000, no_test_files=no_test_files)
     if n_points is not None:
         X = X[:n_points]
-    print(f"loaded {X.shape[0]} points (dim={X.shape[1]}) from {data_path} (test files={no_test_files})")
+    print(f"loaded {X.shape[0]} points (dim={X.shape[1]}) from {data_path} (test files={no_test_files}, method={method})")
 
-    # eps_list = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
-    eps_list = [4e-3, 6e-3, 8e-3]
+    eps_list = [
+        1e-6, 1e-5,
+        1e-4, 2e-4, 3e-4, 4e-4, 5e-4, 6e-4, 7e-4, 8e-4, 9e-4,
+        1e-3, 2e-3, 3e-3, 4e-3, 5e-3, 6e-3, 7e-3, 8e-3, 9e-3,
+        1e-2, 1e-1, 1.0,
+    ]
     start_time = time.perf_counter()
-    results = sweep(network, X, eps_list, k=8, max_diff=0)
+    results = sweep(network, X, eps_list, k=8, max_diff=0, method=method)
     elapsed = time.perf_counter() - start_time
 
     for eps, r in results.items():
