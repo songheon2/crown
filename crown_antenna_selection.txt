@@ -1,0 +1,3 @@
+$ python TopKRobustnessVerification.py x y 2 100 backward_only results_bwd_only.csv
+
+ - x, y는 디폴트 모델 파일과 디폴트 데이터 파일을 사용한다는 의도

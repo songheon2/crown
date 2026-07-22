@@ -31,6 +31,8 @@ from typing import Dict, List
 
 import numpy as np
 
+JNUNNV_HOME_PATH = "../"
+
 from CustomToLirpa import load_custom_network
 from lirpa_forward_backward_fc import (
     Array,
@@ -166,17 +168,20 @@ if __name__ == "__main__":
 
     network_path = (
         sys.argv[1]
-        if len(sys.argv) > 1
-        else "Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin"
+        if len(sys.argv) > 1 and len(sys.argv[1]) > 1
+        else JNUNNV_HOME_PATH + "models/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin"
     )
     data_path = (
         sys.argv[2]
-        if len(sys.argv) > 2
-        else "C:\AI_Verification\wireless\Pickle/mMIMO_AS_training_data_20000_80_H_HTH_ORG_1D-003.pickle"
+        if len(sys.argv) > 2 and len(sys.argv[2]) > 1
+        else JNUNNV_HOME_PATH + "Pickle/mMIMO_AS_training_data_20000_80_H_HTH_ORG_1D.pickle"
     )
     no_test_files = int(sys.argv[3]) if len(sys.argv) > 3 else 2
     n_points = int(sys.argv[4]) if len(sys.argv) > 4 else None
     method = sys.argv[5] if len(sys.argv) > 5 else "backward"
+
+    print(network_path)
+    print(data_path)
 
     if method not in _METHOD_VERIFIER_FACTORIES:
         raise ValueError(
