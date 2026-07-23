@@ -1,3 +1,5 @@
-$ python TopKRobustnessVerification.py x y 2 100 backward_only results_bwd_only.csv
+$ python TopKRobustnessVerification.py --no-test-files 2 --n-points 100 --method backward_only
 
- - x, y는 디폴트 모델 파일과 디폴트 데이터 파일을 사용한다는 의도
+ - --network-path(-n), --data-path(-d)를 생략하면 디폴트 모델 파일과 디폴트 데이터 파일을 사용한다
+ - --method는 backward(기본값) / backward_only / forward 중 선택
+ - 전체 옵션 목록은 `python TopKRobustnessVerification.py --help` 참고
