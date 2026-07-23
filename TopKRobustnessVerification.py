@@ -161,33 +161,40 @@ def sweep(
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
     import time
 
     from data_split import load_test_rows
 
-    network_path = (
-        sys.argv[1]
-        if len(sys.argv) > 1 and len(sys.argv[1]) > 1
-        else JNUNNV_HOME_PATH + "models/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin"
+    parser = argparse.ArgumentParser(description="mMIMO top-k 안테나 선택 로컬 강건성 검증")
+    parser.add_argument(
+        "--network-path", "-n",
+        default=JNUNNV_HOME_PATH + "models/Custom/Baseline mMIMO FC H hard short 80 HTHNN_LAY2_491 RELU 20241018 PRUNED 0.93_NO_SIGMOID_custom.bin",
+        help="커스텀 바이너리(.bin) 네트워크 경로",
     )
-    data_path = (
-        sys.argv[2]
-        if len(sys.argv) > 2 and len(sys.argv[2]) > 1
-        else JNUNNV_HOME_PATH + "Pickle/mMIMO_AS_training_data_20000_80_H_HTH_ORG_1D.pickle"
+    parser.add_argument(
+        "--data-path", "-d",
+        default=JNUNNV_HOME_PATH + "Pickle/mMIMO_AS_training_data_20000_80_H_HTH_ORG_1D.pickle",
+        help="테스트 데이터 pickle 경로",
     )
-    no_test_files = int(sys.argv[3]) if len(sys.argv) > 3 else 2
-    n_points = int(sys.argv[4]) if len(sys.argv) > 4 else None
-    method = sys.argv[5] if len(sys.argv) > 5 else "backward"
+    parser.add_argument("--no-test-files", type=int, default=2, help="로드할 테스트 파일 개수")
+    parser.add_argument("--n-points", type=int, default=None, help="검증할 입력점 개수 (생략 시 전체)")
+    parser.add_argument(
+        "--method",
+        default="backward",
+        choices=sorted(_METHOD_VERIFIER_FACTORIES),
+        help="bound 계산 방식",
+    )
+    args = parser.parse_args()
+
+    network_path = args.network_path
+    data_path = args.data_path
+    no_test_files = args.no_test_files
+    n_points = args.n_points
+    method = args.method
 
     print(network_path)
     print(data_path)
-
-    if method not in _METHOD_VERIFIER_FACTORIES:
-        raise ValueError(
-            f"지원하지 않는 bound 계산 방식입니다: {method!r} "
-            f"({', '.join(_METHOD_VERIFIER_FACTORIES)} 중 하나여야 합니다)"
-        )
 
     network = load_custom_network(network_path)
     X = load_test_rows(data_path, no_dataInFile=20000, no_test_files=no_test_files)
