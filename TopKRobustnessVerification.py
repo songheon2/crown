@@ -41,14 +41,18 @@ from lirpa_forward_backward_fc import (
     LiRPABackwardOnly,
     LiRPAForward,
 )
+from lirpa_backward_only_iteration import LiRPABackwardOnlyIteration
 
 # bound 계산 방식 선택자. "backward"(기본값)는 forward+backward(표준 CROWN),
-# "backward_only"는 중간 bound도 backward substitution만으로 구하는 방식,
-# "forward"는 순수 forward mode다.
+# "backward_only"는 중간 bound도 backward substitution만으로 구하는 방식(재귀 구현),
+# "backward_only_iter"는 backward_only와 수치적으로 동일하지만 재귀 대신 명시적
+# 이중 반복문으로 구현한 버전(upstream에서 추가 — 큰 네트워크에서 재귀 깊이 걱정
+# 없이 쓸 수 있다는 게 장점), "forward"는 순수 forward mode다.
 _METHOD_VERIFIER_FACTORIES = {
     "forward": lambda: LiRPAForward(),
     "backward": lambda: LiRPABackward(LiRPAForward()),
     "backward_only": lambda: LiRPABackwardOnly(),
+    "backward_only_iter": lambda: LiRPABackwardOnlyIteration(),
 }
 
 
